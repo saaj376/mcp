@@ -102,15 +102,17 @@ def index_project(
         graph.add_symbol(mod, MODULE, name=mod, file=rel, line=1)
         _collect_symbols(graph, tree, mod, rel)
 
-    # Index of module -> {short_name -> node_id} for resolving local names.
+    # Index of module -> {short_name -> node_id} for resolving local names, and
+    # a project-wide {short_name -> [ids]} of functions for unique-name fallback.
     module_index = _build_module_index(graph)
+    fn_by_short_name = _build_short_name_index(graph)
 
     # Pass 2: relations.
     for path, mod, tree in files:
         rel = str(path.relative_to(root))
         _resolve_imports(graph, tree, mod)
         aliases = _import_aliases(tree)
-        _resolve_calls(graph, tree, mod, rel, module_index, aliases, report)
+        _resolve_calls(graph, tree, mod, rel, module_index, aliases, fn_by_short_name, report)
 
     return graph, report
 
@@ -134,6 +136,14 @@ def _collect_symbols(graph: CodeGraph, tree: ast.Module, mod: str, rel: str) -> 
                 visit(node.body, node_id)
 
     visit(tree.body, mod)
+
+
+def _build_short_name_index(graph: CodeGraph) -> dict[str, list[str]]:
+    """Map each function short name to every function node id that has it."""
+    index: dict[str, list[str]] = {}
+    for node_id in graph.nodes_of_kind(FUNCTION):
+        index.setdefault(graph.g.nodes[node_id].get("name", ""), []).append(node_id)
+    return index
 
 
 def _build_module_index(graph: CodeGraph) -> dict[str, dict[str, str]]:
@@ -208,12 +218,19 @@ def _resolve_calls(
     rel: str,
     module_index: dict[str, dict[str, str]],
     aliases: dict[str, str],
+    fn_by_short_name: dict[str, list[str]],
     report: BuildReport,
 ) -> None:
-    """Emit CALLS edges from each function to the project symbols it calls."""
+    """Emit CALLS edges from each function to the project symbols it calls.
+
+    Returns a ``(target_id, confident)`` pair per resolved call. ``confident``
+    is False for the unique-short-name fallback (a method call on a variable
+    whose type we can't infer), which is stored as ``resolved=False`` so
+    precision-sensitive consumers can filter it out.
+    """
     locals_ = module_index.get(mod, {})
 
-    def resolve(func: ast.expr, class_id: str | None) -> str | None:
+    def resolve(func: ast.expr, class_id: str | None) -> tuple[str, bool] | None:
         # self.method()  /  cls.method()
         if (
             isinstance(func, ast.Attribute)
@@ -222,13 +239,13 @@ def _resolve_calls(
             and class_id is not None
         ):
             candidate = f"{class_id}.{func.attr}"
-            return candidate if graph.g.has_node(candidate) else None
+            return (candidate, True) if graph.g.has_node(candidate) else None
         # bare name: foo()
         if isinstance(func, ast.Name):
             if func.id in locals_:
-                return locals_[func.id]
+                return locals_[func.id], True
             if func.id in aliases and graph.g.has_node(aliases[func.id]):
-                return aliases[func.id]
+                return aliases[func.id], True
             return None
         # dotted: alias.func(), pkg.mod.func()
         dotted = _dotted(func)
@@ -238,9 +255,14 @@ def _resolve_calls(
         if head in aliases and rest:
             candidate = f"{aliases[head]}.{rest}"
             if graph.g.has_node(candidate):
-                return candidate
+                return candidate, True
         if graph.g.has_node(dotted):
-            return dotted
+            return dotted, True
+        # Fallback: var.method() where method name is unique project-wide.
+        if isinstance(func, ast.Attribute):
+            matches = fn_by_short_name.get(func.attr, [])
+            if len(matches) == 1:
+                return matches[0], False
         return None
 
     def walk_scope(body: list[ast.stmt], class_id: str | None) -> None:
@@ -251,11 +273,11 @@ def _resolve_calls(
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 fn_id = f"{class_id}.{node.name}" if class_id else f"{mod}.{node.name}"
                 for call in (n for n in ast.walk(node) if isinstance(n, ast.Call)):
-                    target = resolve(call.func, class_id)
-                    if target is not None and target != fn_id:
-                        graph.add_relation(fn_id, target, CALLS)
-                    elif target is None:
+                    resolved = resolve(call.func, class_id)
+                    if resolved is None:
                         report.unresolved_calls += 1
+                    elif resolved[0] != fn_id:
+                        graph.add_relation(fn_id, resolved[0], CALLS, resolved=resolved[1])
             elif isinstance(node, ast.ClassDef):
                 cid = f"{class_id}.{node.name}" if class_id else f"{mod}.{node.name}"
                 walk_scope(node.body, cid)
