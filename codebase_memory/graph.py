@@ -56,9 +56,16 @@ class CodeGraph:
         name: str = "",
         file: str = "",
         line: int = 0,
+        end_line: int = 0,
     ) -> None:
-        """Add or update a symbol node. Idempotent on ``node_id``."""
-        self.g.add_node(node_id, kind=kind, name=name, file=file, line=line)
+        """Add or update a symbol node. Idempotent on ``node_id``.
+
+        ``line``/``end_line`` are the 1-based inclusive source span, used to map
+        a changed diff line to its smallest enclosing symbol.
+        """
+        self.g.add_node(
+            node_id, kind=kind, name=name, file=file, line=line, end_line=end_line
+        )
 
     def add_relation(
         self,
@@ -115,11 +122,12 @@ class CodeGraph:
                 DROP TABLE IF EXISTS nodes;
                 DROP TABLE IF EXISTS edges;
                 CREATE TABLE nodes (
-                    id   TEXT PRIMARY KEY,
-                    kind TEXT NOT NULL,
-                    name TEXT,
-                    file TEXT,
-                    line INTEGER
+                    id       TEXT PRIMARY KEY,
+                    kind     TEXT NOT NULL,
+                    name     TEXT,
+                    file     TEXT,
+                    line     INTEGER,
+                    end_line INTEGER
                 );
                 CREATE TABLE edges (
                     src      TEXT NOT NULL,
@@ -133,9 +141,16 @@ class CodeGraph:
                 """
             )
             conn.executemany(
-                "INSERT INTO nodes (id, kind, name, file, line) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO nodes (id, kind, name, file, line, end_line) VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    (n, a.get("kind", ""), a.get("name", ""), a.get("file", ""), a.get("line", 0))
+                    (
+                        n,
+                        a.get("kind", ""),
+                        a.get("name", ""),
+                        a.get("file", ""),
+                        a.get("line", 0),
+                        a.get("end_line", 0),
+                    )
                     for n, a in self.g.nodes(data=True)
                 ),
             )
@@ -158,10 +173,17 @@ class CodeGraph:
         graph = cls()
         conn = sqlite3.connect(db_path)
         try:
-            for node_id, kind, name, file, line in conn.execute(
-                "SELECT id, kind, name, file, line FROM nodes"
+            for node_id, kind, name, file, line, end_line in conn.execute(
+                "SELECT id, kind, name, file, line, end_line FROM nodes"
             ):
-                graph.add_symbol(node_id, kind, name=name or "", file=file or "", line=line or 0)
+                graph.add_symbol(
+                    node_id,
+                    kind,
+                    name=name or "",
+                    file=file or "",
+                    line=line or 0,
+                    end_line=end_line or 0,
+                )
             for src, dst, etype, resolved in conn.execute(
                 "SELECT src, dst, type, resolved FROM edges"
             ):
