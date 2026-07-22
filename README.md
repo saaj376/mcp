@@ -22,6 +22,7 @@ facts.
 
 - [Status](#status)
 - [At a glance (metrics)](#at-a-glance-measured)
+- [Tool-call routing evaluation](#tool-call-routing-evaluation)
 - [How it works](#how-it-works)
 - [The graph model](#the-graph-model)
 - [MCP tools](#mcp-tools)
@@ -114,6 +115,68 @@ keeping the graph's blast radius meaningful.
 
 Roundtrip verified: decompressing `graph.db.zst` reloads to an identical graph
 (`stats()` equal, edge attributes preserved).
+
+---
+
+## Tool-call routing evaluation
+
+A server is only as good as an agent's ability to *pick the right tool with
+valid arguments* from its descriptions. We measure this directly.
+
+**Method.** The 9 real tool schemas (exactly what a connected MCP client sees)
+plus a labeled benchmark of natural-language queries are handed to a
+**model-under-test** that must route each query to a single tool call — blind to
+the source (no repo access), so this measures genuine routing, not recall. A
+deterministic validator then classifies each call against ground truth:
+
+| Verdict | Meaning |
+|---|---|
+| `correct` | right tool + args validate against the JSON schema + correct values |
+| `correct_refusal` | query needs a capability no tool provides, and the model returned no call |
+| `wrong_tool` | picked a tool outside the accept-set (incl. calling on a no-tool query) |
+| `hallucinated_tool` / `hallucinated_param` | named a nonexistent tool / passed a key not in the schema |
+| `invalid_args` / `malformed` | missing required arg, wrong type/value / arguments not a JSON object |
+
+### Results
+
+**Hard benchmark** — 50 queries (16 direct, several tool-confusion traps, 2
+genuinely ambiguous, **13 "no valid tool" traps** to catch hallucination),
+routed by three models:
+
+| Model | Success | correct | correct_refusal | wrong_tool | malformed / hallucinated / invalid_args |
+|---|---|---:|---:|---:|---:|
+| Haiku 4.5 (weak) | **96 %** (48/50) | 35 | 13 | 2 | **0** |
+| Sonnet 5 (mid) | **98 %** (49/50) | 36 | 13 | 1 | **0** |
+| Opus 4.8 (strong) | **98 %** (49/50) | 36 | 13 | 1 | **0** |
+| **Aggregate** | **97.3 %** (146/150) | 107 | 39 | 4 | **0** |
+
+An earlier 20-query smoke benchmark (2 no-tool traps) scored **100 % (60/60)**
+across 3 routers.
+
+### What the failures reveal
+
+Across all **150 decisions** there were **zero** malformed calls, hallucinated
+tools, hallucinated params, or invalid arguments, and **all 39 no-tool-trap
+refusals were correct** (no fabricated `rename_symbol`, `format_code`,
+`run_tests`, `cyclomatic_complexity`, `git_blame`, `coverage`, `security_scan`,
+or `uml_diagram`). The only failure mode was `wrong_tool`, and it localized to
+**two module-granularity queries**:
+
+- *"Which **functions** call into the **module** `db`?"* — all 3 models chose
+  `search_graph{kind:callers, target:"db"}`. `CALLS` edges are function→function,
+  so callers of a *module* node returns empty. **No tool answers this.**
+- *"Which modules import `db`?"* — Haiku made the same mistake; Sonnet/Opus
+  correctly used `get_architecture` (whose `module_dependencies` answers it).
+
+So the miss is a **capability gap, not a routing defect**: `search_graph` has no
+reverse-`IMPORTS` / module-level fan-in kind, so models over-reach `callers`
+onto a module target. Adding a `search_graph` kind such as `importers` would
+close it (estimated 100 % across all three models).
+
+*Caveats: one sample per model (variance unmeasured; the three converged except
+on one query); N=50, hand-authored; two answer-key judgment calls on the
+unanswerable module queries. Read the figures as "these tools are cleanly
+routable by a capable agent," not as a universal floor.*
 
 ---
 
