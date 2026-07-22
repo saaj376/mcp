@@ -9,7 +9,10 @@ Phase 2 surface (read/traversal over the persisted graph):
   - ``get_architecture``  per-module structure and inter-module dependencies
   - ``trace_path``      shortest call chain between two symbols
 
-detect_changes and ingest_traces are introduced in later phases.
+Phase 3 surface:
+  - ``detect_changes``  git diff -> affected symbols, blast radius, risk
+
+ingest_traces is introduced in a later phase.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from codebase_memory import queries
+from codebase_memory.changes import detect_changes as _detect_changes
 from codebase_memory.graph import CodeGraph, default_db_path
 from codebase_memory.indexer import index_project
 
@@ -130,6 +134,34 @@ def trace_path(source: str, target: str, root: str | None = None) -> dict:
     try:
         return queries.trace_path(graph, source, target)
     except KeyError as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+def detect_changes(
+    base: str | None = None,
+    head: str | None = None,
+    root: str | None = None,
+) -> dict:
+    """Map a git diff to affected symbols, blast radius, and a risk classification.
+
+    Args:
+        base: Base git ref. If omitted, diffs the working tree against HEAD.
+            If set, diffs the merge-base range ``base...head``.
+        head: Head git ref (defaults to HEAD when ``base`` is given).
+        root: Project root / git repo (defaults to CODEBASE_MEMORY_ROOT or cwd).
+
+    The persisted graph must reflect the ``head`` state, so run
+    ``index_codebase`` first. Returns a deterministic ``gate_should_block`` flag
+    for CI: true when a high-fan-in symbol changed without a test change.
+    """
+    project = _project_root(root)
+    db_path, graph = _load_graph(root)
+    if graph is None:
+        return {"error": f"No graph at {db_path}. Run index_codebase first."}
+    try:
+        return _detect_changes(graph, project, base=base, head=head)
+    except RuntimeError as exc:
         return {"error": str(exc)}
 
 

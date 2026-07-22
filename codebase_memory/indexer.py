@@ -92,14 +92,16 @@ def index_project(
     for path in _iter_python_files(root, excludes):
         rel = str(path.relative_to(root))
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=rel)
         except (SyntaxError, UnicodeDecodeError) as exc:
             report.parse_errors.append((rel, str(exc)))
             continue
         report.files_parsed += 1
         mod = module_name_for(root, path)
         files.append((path, mod, tree))
-        graph.add_symbol(mod, MODULE, name=mod, file=rel, line=1)
+        n_lines = source.count("\n") + 1
+        graph.add_symbol(mod, MODULE, name=mod, file=rel, line=1, end_line=n_lines)
         _collect_symbols(graph, tree, mod, rel)
 
     # Index of module -> {short_name -> node_id} for resolving local names, and
@@ -127,11 +129,17 @@ def _collect_symbols(graph: CodeGraph, tree: ast.Module, mod: str, rel: str) -> 
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 node_id = f"{parent_id}.{node.name}"
-                graph.add_symbol(node_id, FUNCTION, name=node.name, file=rel, line=node.lineno)
+                end = getattr(node, "end_lineno", node.lineno) or node.lineno
+                graph.add_symbol(
+                    node_id, FUNCTION, name=node.name, file=rel, line=node.lineno, end_line=end
+                )
                 graph.add_relation(parent_id, node_id, CONTAINS)
             elif isinstance(node, ast.ClassDef):
                 node_id = f"{parent_id}.{node.name}"
-                graph.add_symbol(node_id, CLASS, name=node.name, file=rel, line=node.lineno)
+                end = getattr(node, "end_lineno", node.lineno) or node.lineno
+                graph.add_symbol(
+                    node_id, CLASS, name=node.name, file=rel, line=node.lineno, end_line=end
+                )
                 graph.add_relation(parent_id, node_id, CONTAINS)
                 visit(node.body, node_id)
 

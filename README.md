@@ -15,7 +15,7 @@ be committed alongside the repo and read by every agent session.
 | 0 | Package scaffold, MCP server, graph store | ✅ |
 | 1 | Python indexer → modules / classes / functions + CONTAINS / IMPORTS / CALLS edges | ✅ |
 | 2 | Read tools: `search_graph`, `get_architecture`, `trace_path`, dead-code query | ✅ |
-| 3 | `detect_changes` — git diff → blast radius + risk classification | ⏳ |
+| 3 | `detect_changes` — git diff → blast radius + risk classification | ✅ |
 | 4 | `ingest_traces` — runtime `HTTP_CALLS` validation + `.zst` snapshot | ⏳ |
 
 ## Graph model
@@ -45,6 +45,22 @@ is never silently hidden.
   module→module dependencies collapsed from the import graph.
 - **`trace_path(source, target)`** — shortest call chain between two symbols
   over CALLS edges.
+
+## Change analysis (Phase 3)
+
+- **`detect_changes(base, head)`** — parses a git diff (working tree vs HEAD by
+  default, or the `base...head` merge-base range), maps each changed line to its
+  smallest enclosing symbol, and computes the **blast radius** (transitive
+  callers, plus direct importers for module-level changes). It classifies
+  **risk** from the largest fan-in touched and whether tests changed, and
+  returns a deterministic `gate_should_block` — true when a high-fan-in symbol
+  (≥ 5 transitive callers) changed without any accompanying test change. That is
+  the design doc's Layer 1 CI signal: *"PRs that touch high-fan-in functions
+  without a corresponding test change."*
+
+  The persisted graph must reflect the `head` state, so run `index_codebase`
+  first. Note: an uncommitted **new** file is untracked and absent from
+  `git diff HEAD`; use the `base...head` range for committed PR analysis.
 
 ## Install
 
