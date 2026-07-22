@@ -78,6 +78,25 @@ def test_calls_resolved(tmp_path):
     assert ("sample.app.Greeter.loud", "sample.app.Greeter.hello") in calls
 
 
+def test_unique_name_method_fallback(tmp_path):
+    """var.method() binds by unique short name, marked lower-confidence."""
+    src = (
+        "class Repo:\n"
+        "    def persist(self):\n"
+        "        return 1\n"
+        "\n\n"
+        "def run():\n"
+        "    r = Repo()\n"
+        "    return r.persist()\n"
+    )
+    (tmp_path / "m.py").write_text(src)
+    graph, _ = index_project(tmp_path)
+    assert ("m.run", "m.Repo.persist") in set(graph.edges_of_type(CALLS))
+    # the fallback edge is flagged resolved=False (heuristic, not confident)
+    edge = graph.g.get_edge_data("m.run", "m.Repo.persist", key=CALLS)
+    assert edge["resolved"] is False
+
+
 def test_persistence_roundtrip(tmp_path):
     graph, _ = index_project(_make_project(tmp_path))
     db = tmp_path / "graph.db"

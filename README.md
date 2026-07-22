@@ -14,7 +14,7 @@ be committed alongside the repo and read by every agent session.
 |------|-------|-------|
 | 0 | Package scaffold, MCP server, graph store | ✅ |
 | 1 | Python indexer → modules / classes / functions + CONTAINS / IMPORTS / CALLS edges | ✅ |
-| 2 | Read tools: `search_graph`, `get_architecture`, `trace_path`, dead-code query | ⏳ |
+| 2 | Read tools: `search_graph`, `get_architecture`, `trace_path`, dead-code query | ✅ |
 | 3 | `detect_changes` — git diff → blast radius + risk classification | ⏳ |
 | 4 | `ingest_traces` — runtime `HTTP_CALLS` validation + `.zst` snapshot | ⏳ |
 
@@ -27,8 +27,24 @@ be committed alongside the repo and read by every agent session.
   project symbol). Calls into stdlib/third-party code are counted, not edged.
 
 Call resolution is conservative and best-effort: an edge is only emitted when
-the callee binds to a known project symbol. The number of unresolved calls is
-reported so coverage is never silently hidden.
+the callee binds to a known project symbol. `self.`/`cls.` calls, module-local
+calls, and imported calls resolve with high confidence (`resolved=True`). A
+`var.method()` call whose method name is **unique project-wide** binds via a
+lower-confidence fallback (`resolved=False`), so blast-radius consumers can
+filter it out while dead-code detection still benefits. The number of calls
+that resolve to no project symbol (stdlib/third-party) is reported so coverage
+is never silently hidden.
+
+## Read tools (Phase 2)
+
+- **`search_graph(kind, target)`** — structured queries (not Cypher; the backend
+  is networkx). Kinds: `callers`, `callees`, `by_name`, `by_kind`, and
+  `dead_code` (functions with no incoming CALLS or IMPORTS; likely entrypoints
+  like `main`/`test_*`/dunders are reported separately, not dropped).
+- **`get_architecture()`** — per-module classes/functions plus internal
+  module→module dependencies collapsed from the import graph.
+- **`trace_path(source, target)`** — shortest call chain between two symbols
+  over CALLS edges.
 
 ## Install
 
