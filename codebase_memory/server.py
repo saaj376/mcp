@@ -12,7 +12,9 @@ Phase 2 surface (read/traversal over the persisted graph):
 Phase 3 surface:
   - ``detect_changes``  git diff -> affected symbols, blast radius, risk
 
-ingest_traces is introduced in a later phase.
+Phase 4 surface (close the loop + shareable snapshot):
+  - ``ingest_traces``   reconcile runtime HTTP traffic against HTTP_CALLS edges
+  - ``save_snapshot`` / ``load_snapshot``  committable .zst graph snapshot
 """
 
 from __future__ import annotations
@@ -22,9 +24,9 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from codebase_memory import queries
+from codebase_memory import queries, traces
 from codebase_memory.changes import detect_changes as _detect_changes
-from codebase_memory.graph import CodeGraph, default_db_path
+from codebase_memory.graph import CodeGraph, default_db_path, default_snapshot_path
 from codebase_memory.indexer import index_project
 
 mcp = FastMCP("codebase-memory")
@@ -163,6 +165,53 @@ def detect_changes(
         return _detect_changes(graph, project, base=base, head=head)
     except RuntimeError as exc:
         return {"error": str(exc)}
+
+
+@mcp.tool()
+def ingest_traces(traces_data: list[dict], root: str | None = None) -> dict:
+    """Reconcile runtime HTTP traces against the graph's HTTP_CALLS edges.
+
+    Args:
+        traces_data: Observed outbound calls, each
+            ``{"caller": <symbol id>, "method": "GET", "url": "...",
+            "count": <int, optional>}``.
+        root: Project root (defaults to CODEBASE_MEMORY_ROOT or cwd).
+
+    Confirms static edges seen in traffic, adds runtime-only corrections, and
+    flags static edges never exercised. Persists the updated graph.
+    """
+    db_path, graph = _load_graph(root)
+    if graph is None:
+        return {"error": f"No graph at {db_path}. Run index_codebase first."}
+    report = traces.ingest_traces(graph, traces_data)
+    graph.save(db_path)
+    return report
+
+
+@mcp.tool()
+def save_snapshot(root: str | None = None) -> dict:
+    """Compress the graph database to the committable ``graph.db.zst`` snapshot."""
+    project = _project_root(root)
+    db_path = default_db_path(project)
+    if not db_path.exists():
+        return {"error": f"No graph at {db_path}. Run index_codebase first."}
+    snapshot = traces.save_snapshot(db_path, default_snapshot_path(project))
+    return {
+        "snapshot": str(snapshot),
+        "db_bytes": db_path.stat().st_size,
+        "snapshot_bytes": snapshot.stat().st_size,
+    }
+
+
+@mcp.tool()
+def load_snapshot(root: str | None = None) -> dict:
+    """Restore ``graph.db`` from the committed ``graph.db.zst`` snapshot."""
+    project = _project_root(root)
+    snapshot = default_snapshot_path(project)
+    if not snapshot.exists():
+        return {"error": f"No snapshot at {snapshot}."}
+    graph = traces.load_snapshot(snapshot, default_db_path(project))
+    return {"snapshot": str(snapshot), "stats": graph.stats()}
 
 
 def main() -> None:

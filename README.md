@@ -1,97 +1,333 @@
 # codebase-memory-mcp
 
 A persistent, queryable **structural knowledge graph** of a codebase, exposed
-over the [Model Context Protocol](https://modelcontextprotocol.io). It gives
-CI gates, AI code review, and runtime feedback loops one shared picture of the
-code instead of each re-deriving repo structure from scratch.
+over the [Model Context Protocol](https://modelcontextprotocol.io). It gives a
+CI gate, an AI code‑review step, and a runtime feedback loop **one shared
+picture** of the code instead of each re-deriving repo structure from grep and
+file reads on every run.
 
-The graph is a single SQLite file under `.codebase-memory/graph.db`, so it can
-be committed alongside the repo and read by every agent session.
+The graph is a single SQLite file under `.codebase-memory/graph.db` (and a
+compressed, committable `graph.db.zst` snapshot), so every agent session — a
+mentor's, a student's, and CI's headless review — reads the same structural
+facts.
 
-## Status — phased build
+> **Provenance.** This implements the *Combined Code Quality Strategy* design
+> doc: a shared code knowledge graph sitting underneath three enforcement layers
+> (CI gate → AI review → canary runtime). Each MCP tool below maps to a specific
+> role that document assigns to the graph.
+
+---
+
+## Contents
+
+- [Status](#status)
+- [At a glance (metrics)](#at-a-glance-measured)
+- [How it works](#how-it-works)
+- [The graph model](#the-graph-model)
+- [MCP tools](#mcp-tools)
+- [Call-resolution semantics](#call-resolution-semantics)
+- [Risk classification](#risk-classification-detect_changes)
+- [Install](#install)
+- [Usage](#usage)
+- [Persistence & schema](#persistence--schema)
+- [Testing](#testing)
+- [Limitations & deliberate scope choices](#limitations--deliberate-scope-choices)
+- [Project layout](#project-layout)
+
+---
+
+## Status
+
+All four phases of the design are implemented, tested, and dogfooded on this
+repository.
 
 | Phase | Scope | State |
-|------|-------|-------|
+|------:|-------|:-----:|
 | 0 | Package scaffold, MCP server, graph store | ✅ |
-| 1 | Python indexer → modules / classes / functions + CONTAINS / IMPORTS / CALLS edges | ✅ |
+| 1 | Python indexer → `module` / `class` / `function` nodes + `CONTAINS` / `IMPORTS` / `CALLS` edges | ✅ |
 | 2 | Read tools: `search_graph`, `get_architecture`, `trace_path`, dead-code query | ✅ |
 | 3 | `detect_changes` — git diff → blast radius + risk classification | ✅ |
-| 4 | `ingest_traces` — runtime `HTTP_CALLS` validation + `.zst` snapshot | ⏳ |
+| 4 | `ingest_traces` — runtime `HTTP_CALLS` validation + `.zst` snapshot | ✅ |
 
-## Graph model
+### How the tools map to the doc's three layers
 
-- **Nodes** — `module`, `class`, `function` (fully-qualified ids, e.g.
-  `pkg.mod.Class.method`), each carrying `file` and `line`.
-- **Edges** — `CONTAINS` (module→class/function, class→method),
-  `IMPORTS` (module→imported module/symbol), `CALLS` (function→resolved
-  project symbol). Calls into stdlib/third-party code are counted, not edged.
+| Layer (design doc) | What it does | Tools |
+|---|---|---|
+| **L1 — CI gate** | deterministic pass/fail structural gates | `detect_changes` (blast radius + `gate_should_block`), `search_graph` (dead code) |
+| **L2 — AI review** | ground review in the graph, cite real callers | `trace_path`, `get_architecture`, `search_graph` |
+| **L3 — runtime** | validate/correct the graph from canary traffic | `ingest_traces` |
+| **Shared substrate** | one committed structural index for every session | `save_snapshot` / `load_snapshot` (`graph.db.zst`) |
 
-Call resolution is conservative and best-effort: an edge is only emitted when
-the callee binds to a known project symbol. `self.`/`cls.` calls, module-local
-calls, and imported calls resolve with high confidence (`resolved=True`). A
-`var.method()` call whose method name is **unique project-wide** binds via a
-lower-confidence fallback (`resolved=False`), so blast-radius consumers can
-filter it out while dead-code detection still benefits. The number of calls
-that resolve to no project symbol (stdlib/third-party) is reported so coverage
-is never silently hidden.
+---
 
-## Read tools (Phase 2)
+## At a glance (measured)
 
-- **`search_graph(kind, target)`** — structured queries (not Cypher; the backend
-  is networkx). Kinds: `callers`, `callees`, `by_name`, `by_kind`, and
-  `dead_code` (functions with no incoming CALLS or IMPORTS; likely entrypoints
-  like `main`/`test_*`/dunders are reported separately, not dropped).
-- **`get_architecture()`** — per-module classes/functions plus internal
-  module→module dependencies collapsed from the import graph.
-- **`trace_path(source, target)`** — shortest call chain between two symbols
-  over CALLS edges.
+All figures below are **measured**, not estimated — from the test suite and from
+indexing this repository itself (7 source modules + 4 test modules = 11 Python
+files).
 
-## Change analysis (Phase 3)
+### Test suite
 
-- **`detect_changes(base, head)`** — parses a git diff (working tree vs HEAD by
-  default, or the `base...head` merge-base range), maps each changed line to its
-  smallest enclosing symbol, and computes the **blast radius** (transitive
-  callers, plus direct importers for module-level changes). It classifies
-  **risk** from the largest fan-in touched and whether tests changed, and
-  returns a deterministic `gate_should_block` — true when a high-fan-in symbol
-  (≥ 5 transitive callers) changed without any accompanying test change. That is
-  the design doc's Layer 1 CI signal: *"PRs that touch high-fan-in functions
-  without a corresponding test change."*
+| Metric | Value |
+|---|---|
+| Tests | **23 passing** |
+| Runtime | **0.22 s** |
+| Test code | 452 lines across 4 files |
+| Coverage by area | indexer 6 · queries 6 · changes 5 · traces 6 |
 
-  The persisted graph must reflect the `head` state, so run `index_codebase`
-  first. Note: an uncommitted **new** file is untracked and absent from
-  `git diff HEAD`; use the `base...head` range for committed PR analysis.
+### Graph built from this repo (`index_codebase` on `.`)
+
+| Nodes: 119 total | Edges: 329 total |
+|---|---|
+| `module` 11 | `CONTAINS` 94 |
+| `class` 2 | `IMPORTS` 65 |
+| `function` 92 | `CALLS` 170 |
+| `endpoint` 0¹ | `HTTP_CALLS` 0¹ |
+
+¹ This repo makes no outbound HTTP client calls, so there are no endpoints to
+infer — expected.
+
+### Call-resolution coverage (this repo)
+
+| Call class | Count | Edged? |
+|---|---:|:---:|
+| Confident project calls (`resolved=True`) | 123 | ✅ |
+| Heuristic unique-name calls (`resolved=False`) | 47 | ✅ |
+| Stdlib / third-party (e.g. `ast.walk`, `conn.execute`) | 349 | ❌ (counted, not edged) |
+
+The 349 unresolved are reported in the build report — coverage is never silently
+hidden. Only calls that bind to a **project** symbol become `CALLS` edges,
+keeping the graph's blast radius meaningful.
+
+### Dead-code query (this repo)
+
+| Result | Count |
+|---|---:|
+| Dead-code candidates | 11 |
+| Excluded as entrypoints (`main`/`test_*`/dunders) | 25 |
+
+### Snapshot compression
+
+| `graph.db` | `graph.db.zst` | Reduction |
+|---:|---:|:---:|
+| 126,976 B (124 KB) | 16,046 B (15.7 KB) | **87.4 % smaller (7.9×)** |
+
+Roundtrip verified: decompressing `graph.db.zst` reloads to an identical graph
+(`stats()` equal, edge attributes preserved).
+
+---
+
+## How it works
+
+```
+                         ┌───────────────────────────────────────────────┐
+   Python source ──ast──▶│  indexer.py    two-pass AST walk               │
+                         │   pass 1: collect module/class/function nodes  │
+                         │   pass 2: resolve IMPORTS / CALLS / HTTP_CALLS  │
+                         └───────────────────────┬───────────────────────┘
+                                                 ▼
+   git diff ──▶ changes.py ──┐        ┌──────────────────────────┐
+                             ├──────▶ │  graph.py                │──save──▶ .codebase-memory/graph.db
+   runtime traces ─▶ traces.py ┘      │  MultiDiGraph + SQLite   │──zstd──▶ .codebase-memory/graph.db.zst
+                                      └───────────┬──────────────┘
+   queries.py (read) ◀──────────────────────────┘
+                                                 ▼
+                                    server.py  (FastMCP, 9 tools over stdio)
+```
+
+- **In memory** the graph is a `networkx.MultiDiGraph`; edges are keyed by type
+  so a `CONTAINS` and a `CALLS` edge between the same two symbols coexist.
+- **On disk** it is one SQLite file (`nodes` + `edges` tables), plus an optional
+  zstd‑compressed snapshot for committing.
+- **Every tool** loads the persisted graph rather than re-parsing the repo,
+  which is the whole point: structure is derived once and shared.
+
+---
+
+## The graph model
+
+### Nodes
+
+| Kind | Id scheme | Example | Extra attributes |
+|---|---|---|---|
+| `module` | dotted path | `codebase_memory.indexer` | `file`, `line`, `end_line` |
+| `class` | `module.Class` | `codebase_memory.graph.CodeGraph` | `file`, `line`, `end_line` |
+| `function` | `module.func` / `module.Class.method` | `codebase_memory.graph.CodeGraph.save` | `file`, `line`, `end_line` |
+| `endpoint` | `"<METHOD> <scheme>://<host><path>"` | `GET http://users.svc/v1/user` | (runtime/static observed) |
+| `external` | caller id from a trace not in the graph | `gateway` | created by `ingest_traces` |
+
+`line`/`end_line` are the 1‑based inclusive source span — this is what lets a
+changed diff line map to its **smallest enclosing** symbol.
+
+### Edges
+
+| Type | From → To | Meaning | Key attributes |
+|---|---|---|---|
+| `CONTAINS` | module→class/function, class→method | lexical containment | — |
+| `IMPORTS` | module → imported symbol/module | binds to the concrete imported symbol when it exists | `resolved` |
+| `CALLS` | function → function/class | resolved intra-project call (constructor calls target the class node) | `resolved` (confidence) |
+| `HTTP_CALLS` | function/external → endpoint | outbound HTTP call | `source` (`static`/`runtime`), `confirmed`, `status`, `count` |
+
+---
+
+## MCP tools
+
+Nine tools over stdio. Every tool accepts an optional `root` (defaults to the
+`CODEBASE_MEMORY_ROOT` env var, else the current working directory). Read tools
+return `{"error": ...}` if the graph hasn't been built yet.
+
+### `index_codebase(root=None)`
+Indexes a Python project and **persists** the graph to `.codebase-memory/graph.db`.
+Returns `stats` and a build `report` (files parsed, parse errors, unresolved-call
+count).
+
+### `graph_stats(root=None)`
+Node/edge counts for the persisted graph, without re-indexing.
+
+### `search_graph(kind, target=None, root=None)`
+Structured queries — **not** Cypher; the backend is networkx.
+
+| `kind` | `target` | Returns |
+|---|---|---|
+| `callers` | symbol id | direct callers (incoming `CALLS`) |
+| `callees` | symbol id | direct callees (outgoing `CALLS`) |
+| `by_name` | name substring (case-insensitive) | matching symbols |
+| `by_kind` | `module`/`class`/`function` | all symbols of that kind |
+| `dead_code` | *(none)* | functions with **no** incoming `CALLS` or `IMPORTS`; likely entrypoints reported separately in `excluded_as_entrypoints` |
+
+### `get_architecture(root=None)`
+Per-module classes/functions plus internal **module → module** dependencies
+(collapsed from the import graph). Dogfooded on this repo: 11 modules, **21
+internal dependencies**.
+
+### `trace_path(source, target, root=None)`
+Shortest call chain between two fully-qualified symbols over `CALLS` edges.
+
+```jsonc
+// trace_path("sample.app.Greeter.loud", "sample.helpers.shout")  — from the tests
+{
+  "found": true, "hops": 3,
+  "path": ["sample.app.Greeter.loud", "sample.app.Greeter.hello",
+           "sample.app.greet", "sample.helpers.shout"]
+}
+```
+
+### `detect_changes(base=None, head=None, root=None)`
+Maps a git diff to affected symbols, blast radius, and a risk classification.
+`base=None` diffs the working tree vs `HEAD`; a `base` diffs the merge-base
+range `base...head`.
+
+```jsonc
+// A 5-caller core() modified without touching tests — from the tests
+{
+  "changed_files": ["app.py"],
+  "tests_changed": false,
+  "affected_symbols": [
+    {"id": "app.core", "kind": "function", "fan_in": 5,
+     "direct_callers": ["app.a","app.b","app.c","app.d","app.e"], "changed_lines": [2]}
+  ],
+  "blast_radius": ["app.a","app.b","app.c","app.d","app.e"],
+  "blast_radius_size": 5,
+  "risk": "high",
+  "gate_should_block": true,
+  "risk_reasons": [
+    "A changed symbol has 5 transitive callers (>= 5).",
+    "High-fan-in change with no accompanying test change."
+  ]
+}
+```
+
+### `ingest_traces(traces_data, root=None)`
+Reconciles observed runtime calls against static `HTTP_CALLS` edges. Each trace:
+`{"caller": <symbol id>, "method": "GET", "url": "...", "count": <int?>}`.
+
+| Bucket | Meaning |
+|---|---|
+| `confirmed` | a static edge that traffic also exercised |
+| `runtime_only` | traffic hit a route static analysis missed (a **correction** — dynamic dispatch, config routing, non-literal URLs) |
+| `unconfirmed_static` | a static edge never seen in traffic (**suspected mis-inference** — the graph drifting from reality) |
+| `unknown_callers` | trace callers not present in the graph (added as `external` nodes) |
+
+### `save_snapshot(root=None)` / `load_snapshot(root=None)`
+Compress `graph.db` → committable `graph.db.zst` (~87 % smaller here) and
+restore it. Commit the `.zst` alongside the repo so CI and every local session
+start from the same graph.
+
+---
+
+## Call-resolution semantics
+
+Resolution is conservative and **best-effort by design**. An edge is emitted
+only when the callee binds to a known project symbol; the confidence is recorded
+on the edge so different consumers can choose their tolerance.
+
+| Case | Example | Confidence |
+|---|---|---|
+| `self.`/`cls.` method | `self.hello()` | `resolved=True` |
+| module-local name | `greet()` defined in the same module | `resolved=True` |
+| imported symbol | `from a import c; c()` | `resolved=True` |
+| module-aliased call | `import a.b as x; x.f()` | `resolved=True` |
+| **unique-name fallback** | `repo.persist()` where `persist` is the only `persist` project-wide | `resolved=False` (heuristic) |
+| stdlib / third-party / non-unique | `conn.execute(...)`, `text.upper()` | *no edge* (counted in report) |
+
+The `resolved=False` fallback is what makes the **dead-code** query usable:
+method-calls-on-variables would otherwise leave every such method looking
+uncalled. Blast-radius (`detect_changes`) currently includes these edges — a
+conservative choice (over-estimate impact rather than under-estimate); the flag
+is available if you want confident-only.
+
+---
+
+## Risk classification (`detect_changes`)
+
+Deterministic — no model judgment — so it can drive a CI gate.
+
+| Risk | Condition |
+|---|---|
+| `high` | a changed symbol has **≥ 5** transitive callers (`HIGH_FANIN`) |
+| `medium` | changed symbols have ≥ 1 caller |
+| `low` | changed symbols have no in-project callers, or no code symbols changed |
+
+`gate_should_block = (risk == "high") and not tests_changed` — the design doc's
+Layer 1 signal: *"PRs that touch high-fan-in functions without a corresponding
+test change."*
+
+---
 
 ## Install
+
+Requires Python ≥ 3.10 (developed on **3.12.3**).
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-## Use
+Dependencies: `mcp` (server), `networkx` 3.x (graph), `zstandard` (snapshots),
+`pytest` (dev). No external database or server process.
 
-Run the tests:
+---
 
-```bash
-pytest
-```
+## Usage
 
-Index a project from Python:
+### Python API
 
 ```python
 from codebase_memory.indexer import index_project
 from codebase_memory.graph import default_db_path
+from codebase_memory import queries
 
-graph, report = index_project("/path/to/project")
-graph.save(default_db_path("/path/to/project"))
-print(graph.stats(), report.as_dict())
+graph, report = index_project(".")
+graph.save(default_db_path("."))
+
+print(graph.stats())                       # node/edge counts
+print(queries.find_dead_code(graph))       # zero-caller functions
+print(queries.get_architecture(graph))     # module dependency map
 ```
 
 ### As an MCP server
 
-The server exposes `index_codebase` and `graph_stats` tools over stdio. Add to
-an MCP client (e.g. Claude Code `.mcp.json`):
+Add to an MCP client (e.g. Claude Code `.mcp.json`):
 
 ```json
 {
@@ -104,5 +340,92 @@ an MCP client (e.g. Claude Code `.mcp.json`):
 }
 ```
 
-`CODEBASE_MEMORY_ROOT` (or the `root` tool argument) selects which project to
-index; it defaults to the current working directory.
+### CI gate (Layer 1) sketch
+
+```bash
+# 1. build the graph for the PR head
+codebase-memory-mcp  # or: python -c "from codebase_memory.indexer import index_project; ..."
+
+# 2. call detect_changes(base="origin/main") via the MCP client and fail on:
+#      gate_should_block == true
+# 3. commit graph.db.zst so the next run and reviewers share the same index
+```
+
+The graph must reflect the `head` state, so **index before** calling
+`detect_changes`. Note: a brand-new **untracked** file is absent from
+`git diff HEAD` — use the `base...head` range for committed PR analysis.
+
+---
+
+## Persistence & schema
+
+SQLite, two tables:
+
+```sql
+nodes(id TEXT PRIMARY KEY, kind TEXT, name TEXT, file TEXT, line INT, end_line INT)
+edges(src TEXT, dst TEXT, type TEXT, attrs TEXT)   -- attrs = JSON of edge attributes
+      -- indexed on src, dst, type
+```
+
+Edge attributes are stored as a JSON blob (`attrs`) rather than fixed columns,
+so structural edges (`resolved`) and `HTTP_CALLS` edges
+(`source`/`confirmed`/`status`/`count`) share one schema. The `.zst` snapshot is
+just this file, zstd‑compressed.
+
+---
+
+## Testing
+
+```bash
+pytest            # 23 tests, ~0.22 s
+pytest -v         # per-test breakdown
+```
+
+| File | Tests | What it pins |
+|---|---:|---|
+| `test_indexer.py` | 6 | symbol collection, `CONTAINS`/`IMPORTS`/`CALLS`, unique-name fallback (`resolved=False`), persistence roundtrip |
+| `test_queries.py` | 6 | callers/callees, dead code + entrypoint exclusion, `by_name`/`by_kind`, `trace_path` (found & none), architecture |
+| `test_changes.py` | 5 | diff parsing (modify/add/delete), high-risk blocks without tests, low-risk when no callers, test-change suppresses block — over a **real git repo** |
+| `test_traces.py` | 6 | endpoint normalization, static HTTP inference, confirmed/runtime_only/unconfirmed buckets, unknown callers, `.zst` roundtrip |
+
+---
+
+## Limitations & deliberate scope choices
+
+These are intentional given the design and the chosen backend, not oversights:
+
+- **Structured queries, not Cypher.** The backend is SQLite + networkx (chosen
+  over Kùzu/Neo4j), so `search_graph` exposes named query kinds rather than an
+  open query language.
+- **Python only.** Indexing uses the stdlib `ast` module. Multi-language would
+  mean adding tree-sitter.
+- **Static call resolution is conservative.** Method calls on variables resolve
+  only via the unique-name heuristic; non-unique or dynamically-dispatched calls
+  are left to runtime (`ingest_traces`) — exactly the loop the doc describes.
+- **`HTTP_CALLS` static inference is literal-URL only.** `requests`/`httpx`/
+  `aiohttp`/`urllib` calls with a string-literal URL. f-string / config-driven
+  URLs are the gap runtime traces fill by design.
+- **Dead code isn't decorator-aware.** `@property` accessors and
+  `@mcp.tool()`-style framework entrypoints show as zero-caller (correct by the
+  doc's definition, but noise if you want them excluded).
+- **`HIGH_FANIN = 5`** is a hardcoded threshold.
+- **Untracked new files** don't appear in `git diff HEAD` (a git limitation);
+  use `base...head` for committed PRs.
+
+---
+
+## Project layout
+
+```
+codebase_memory/
+  __init__.py      7    package exports
+  graph.py       214    CodeGraph: MultiDiGraph + SQLite persistence + snapshot paths
+  indexer.py     339    two-pass AST indexer, call resolution, static HTTP inference
+  queries.py     196    read/traversal queries (search_graph, architecture, trace_path)
+  changes.py     214    detect_changes: git diff → blast radius → risk
+  traces.py      135    ingest_traces reconciliation + .zst snapshot save/load
+  server.py      223    FastMCP server wiring the 9 tools
+tests/           452    23 tests (indexer, queries, changes, traces)
+```
+
+*Source: 1,328 lines across 7 modules; tests: 452 lines. (Measured via `wc -l`.)*

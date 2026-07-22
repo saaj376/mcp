@@ -11,29 +11,38 @@ per the design doc's "shared structural graph" property.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterator
 
 import networkx as nx
 
 DEFAULT_DIR = ".codebase-memory"
 DB_NAME = "graph.db"
+SNAPSHOT_NAME = "graph.db.zst"
 
 # Node kinds
 MODULE = "module"
 CLASS = "class"
 FUNCTION = "function"
+ENDPOINT = "endpoint"  # an HTTP endpoint target (runtime/statically observed)
 
 # Edge types
 CONTAINS = "CONTAINS"
 IMPORTS = "IMPORTS"
 CALLS = "CALLS"
+HTTP_CALLS = "HTTP_CALLS"  # function -> endpoint, validated by runtime traces
 
 
 def default_db_path(root: str | Path) -> Path:
     """Location of the graph database for a project rooted at ``root``."""
     return Path(root) / DEFAULT_DIR / DB_NAME
+
+
+def default_snapshot_path(root: str | Path) -> Path:
+    """Location of the committable compressed snapshot for ``root``."""
+    return Path(root) / DEFAULT_DIR / SNAPSHOT_NAME
 
 
 class CodeGraph:
@@ -83,6 +92,18 @@ class CodeGraph:
         """
         self.g.add_edge(src, dst, key=edge_type, type=edge_type, resolved=resolved)
 
+    def add_typed_edge(self, src: str, dst: str, edge_type: str, **attrs) -> None:
+        """Add/replace a typed edge carrying arbitrary attributes.
+
+        Used for edges richer than the structural ones (e.g. HTTP_CALLS, which
+        carries ``source``/``confirmed``/``status``/``count``).
+        """
+        self.g.add_edge(src, dst, key=edge_type, type=edge_type, **attrs)
+
+    def edge_attrs(self, src: str, dst: str, edge_type: str) -> dict | None:
+        """Attributes of a specific typed edge, or None if it does not exist."""
+        return self.g.get_edge_data(src, dst, key=edge_type)
+
     # -- introspection ----------------------------------------------------
     @property
     def num_nodes(self) -> int:
@@ -105,9 +126,9 @@ class CodeGraph:
     def stats(self) -> dict[str, int]:
         """Node/edge counts broken down by kind and type."""
         out: dict[str, int] = {"nodes": self.num_nodes, "edges": self.num_edges}
-        for kind in (MODULE, CLASS, FUNCTION):
+        for kind in (MODULE, CLASS, FUNCTION, ENDPOINT):
             out[f"nodes.{kind}"] = sum(1 for _ in self.nodes_of_kind(kind))
-        for etype in (CONTAINS, IMPORTS, CALLS):
+        for etype in (CONTAINS, IMPORTS, CALLS, HTTP_CALLS):
             out[f"edges.{etype}"] = sum(1 for _ in self.edges_of_type(etype))
         return out
 
@@ -130,10 +151,10 @@ class CodeGraph:
                     end_line INTEGER
                 );
                 CREATE TABLE edges (
-                    src      TEXT NOT NULL,
-                    dst      TEXT NOT NULL,
-                    type     TEXT NOT NULL,
-                    resolved INTEGER NOT NULL DEFAULT 1
+                    src   TEXT NOT NULL,
+                    dst   TEXT NOT NULL,
+                    type  TEXT NOT NULL,
+                    attrs TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE INDEX idx_edges_src ON edges(src);
                 CREATE INDEX idx_edges_dst ON edges(dst);
@@ -155,9 +176,9 @@ class CodeGraph:
                 ),
             )
             conn.executemany(
-                "INSERT INTO edges (src, dst, type, resolved) VALUES (?, ?, ?, ?)",
+                "INSERT INTO edges (src, dst, type, attrs) VALUES (?, ?, ?, ?)",
                 (
-                    (s, d, a.get("type", k), int(a.get("resolved", True)))
+                    (s, d, a.get("type", k), json.dumps({k2: v for k2, v in a.items() if k2 != "type"}))
                     for s, d, k, a in self.g.edges(keys=True, data=True)
                 ),
             )
@@ -184,10 +205,10 @@ class CodeGraph:
                     line=line or 0,
                     end_line=end_line or 0,
                 )
-            for src, dst, etype, resolved in conn.execute(
-                "SELECT src, dst, type, resolved FROM edges"
+            for src, dst, etype, attrs in conn.execute(
+                "SELECT src, dst, type, attrs FROM edges"
             ):
-                graph.add_relation(src, dst, etype, resolved=bool(resolved))
+                graph.add_typed_edge(src, dst, etype, **json.loads(attrs or "{}"))
         finally:
             conn.close()
         return graph

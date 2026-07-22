@@ -25,11 +25,17 @@ from codebase_memory.graph import (
     CALLS,
     CLASS,
     CONTAINS,
+    ENDPOINT,
     FUNCTION,
+    HTTP_CALLS,
     IMPORTS,
     MODULE,
     CodeGraph,
 )
+from codebase_memory.traces import HTTP_METHODS, normalize_endpoint
+
+# Import roots whose method calls are treated as outbound HTTP.
+_HTTP_CLIENTS = {"requests", "httpx", "aiohttp", "urllib"}
 
 DEFAULT_EXCLUDES = {
     ".git",
@@ -219,6 +225,38 @@ def _dotted(node: ast.expr) -> str | None:
     return None
 
 
+def _http_endpoint(call: ast.Call, aliases: dict[str, str]) -> str | None:
+    """If ``call`` is an outbound HTTP client call with a literal URL, return
+    its normalized endpoint id; else None.
+
+    Recognizes ``requests``/``httpx``/``aiohttp``/``urllib`` method calls
+    (e.g. ``requests.get("http://svc/x")``) and ``urllib`` ``urlopen``. Only
+    string-literal URLs are inferred — non-literal URLs are exactly the gap that
+    runtime traces fill.
+    """
+    func = call.func
+    if not isinstance(func, ast.Attribute) or not call.args:
+        return None
+    dotted = _dotted(func)
+    if dotted is None:
+        return None
+    head = dotted.split(".", 1)[0]
+    root_pkg = aliases.get(head, head).split(".")[0]
+    if root_pkg not in _HTTP_CLIENTS:
+        return None
+    attr = func.attr.lower()
+    if attr in HTTP_METHODS:
+        method = attr.upper()
+    elif attr == "urlopen":
+        method = "GET"
+    else:
+        return None
+    url_node = call.args[0]
+    if isinstance(url_node, ast.Constant) and isinstance(url_node.value, str):
+        return normalize_endpoint(method, url_node.value)
+    return None
+
+
 def _resolve_calls(
     graph: CodeGraph,
     tree: ast.Module,
@@ -281,6 +319,14 @@ def _resolve_calls(
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 fn_id = f"{class_id}.{node.name}" if class_id else f"{mod}.{node.name}"
                 for call in (n for n in ast.walk(node) if isinstance(n, ast.Call)):
+                    endpoint = _http_endpoint(call, aliases)
+                    if endpoint is not None:
+                        graph.add_symbol(endpoint, ENDPOINT, name=endpoint)
+                        graph.add_typed_edge(
+                            fn_id, endpoint, HTTP_CALLS,
+                            source="static", confirmed=False, status="inferred", count=0,
+                        )
+                        continue
                     resolved = resolve(call.func, class_id)
                     if resolved is None:
                         report.unresolved_calls += 1
