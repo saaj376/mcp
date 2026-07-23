@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Graph database — the committable artifact is the .zst snapshot, not the db.
+.codebase-memory/graph.db

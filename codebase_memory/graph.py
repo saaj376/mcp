@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import networkx as nx
 
@@ -187,7 +187,7 @@ class CodeGraph:
             conn.close()
 
     @classmethod
-    def load(cls, db_path: str | Path) -> "CodeGraph":
+    def load(cls, db_path: str | Path) -> CodeGraph:
         db_path = Path(db_path)
         if not db_path.exists():
             raise FileNotFoundError(f"No graph database at {db_path}")

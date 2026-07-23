@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from codebase_memory import queries
-from codebase_memory.graph import CLASS, FUNCTION
+from codebase_memory.graph import CLASS
 from codebase_memory.indexer import index_project
 
 # app.py:

@@ -9,13 +9,22 @@ dependencies = [
     "mcp>=1.2.0",
     "networkx>=3.0",
     "zstandard>=0.21",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.6",
+    "mypy>=1.8",
+    "build>=1.0",
+    "pip-audit>=2.7",
+    "bandit>=1.7",
+]
 
 [project.scripts]
 codebase-memory-mcp = "codebase_memory.server:main"
+codebase-memory-gate = "codebase_memory.governance.gate:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -26,3 +35,19 @@ packages = ["codebase_memory"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+# 120 matches the existing codebase; a shorter limit would only force a
+# reformat of code that predates the lint gate.
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+
+[tool.bandit]
+exclude_dirs = ["tests"]

@@ -26,6 +26,7 @@ facts.
 - [How it works](#how-it-works)
 - [The graph model](#the-graph-model)
 - [MCP tools](#mcp-tools)
+- [Governance (Phase 5)](#governance-phase-5)
 - [Call-resolution semantics](#call-resolution-semantics)
 - [Risk classification](#risk-classification-detect_changes)
 - [Install](#install)
@@ -39,7 +40,7 @@ facts.
 
 ## Status
 
-All four phases of the design are implemented, tested, and dogfooded on this
+All five phases of the design are implemented, tested, and dogfooded on this
 repository.
 
 | Phase | Scope | State |
@@ -49,12 +50,13 @@ repository.
 | 2 | Read tools: `search_graph`, `get_architecture`, `trace_path`, dead-code query | ✅ |
 | 3 | `detect_changes` — git diff → blast radius + risk classification | ✅ |
 | 4 | `ingest_traces` — runtime `HTTP_CALLS` validation + `.zst` snapshot | ✅ |
+| 5 | Governance: required status checks, branch protection, org rulesets, static/security analysis | ✅ |
 
 ### How the tools map to the doc's three layers
 
 | Layer (design doc) | What it does | Tools |
 |---|---|---|
-| **L1 — CI gate** | deterministic pass/fail structural gates | `detect_changes` (blast radius + `gate_should_block`), `search_graph` (dead code) |
+| **L1 — CI gate** | deterministic pass/fail structural gates | `audit_governance`, `scaffold_ci`, `apply_branch_protection`, `apply_org_ruleset`, `run_quality_checks`, `detect_changes` (blast radius + `gate_should_block`), `search_graph` (dead code) |
 | **L2 — AI review** | ground review in the graph, cite real callers | `trace_path`, `get_architecture`, `search_graph` |
 | **L3 — runtime** | validate/correct the graph from canary traffic | `ingest_traces` |
 | **Shared substrate** | one committed structural index for every session | `save_snapshot` / `load_snapshot` (`graph.db.zst`) |
@@ -235,7 +237,7 @@ changed diff line map to its **smallest enclosing** symbol.
 
 ## MCP tools
 
-Nine tools over stdio. Every tool accepts an optional `root` (defaults to the
+Fourteen tools over stdio. Every tool accepts an optional `root` (defaults to the
 `CODEBASE_MEMORY_ROOT` env var, else the current working directory). Read tools
 return `{"error": ...}` if the graph hasn't been built yet.
 
@@ -315,6 +317,62 @@ Reconciles observed runtime calls against static `HTTP_CALLS` edges. Each trace:
 Compress `graph.db` → committable `graph.db.zst` (~87 % smaller here) and
 restore it. Commit the `.zst` alongside the repo so CI and every local session
 start from the same graph.
+
+---
+
+## Governance (Phase 5)
+
+The first four phases build the graph. Phase 5 is the enforcement layer that
+consumes it — and it operates on **any repository the connected user is working
+on**, not just this one. Design rationale: [`docs/governance-design.md`](docs/governance-design.md).
+
+### The single source of truth
+
+One registry, [`governance/checks.py`](codebase_memory/governance/checks.py),
+is read by three consumers, so local runs, CI, and the required-check list
+cannot drift apart:
+
+| Check id | Command | Category | Blocking |
+|---|---|---|:--:|
+| `lint` | `ruff check .` | lint | ✅ |
+| `typecheck` | `mypy <pkg>` | types | ✅ |
+| `test` | `pytest -q` | test | ✅ |
+| `build` | `python -m build` | build | ✅ |
+| `deps` | `pip-audit --skip-editable` | security | ✅ |
+| `sast` | `bandit -r <pkg> --severity-level medium` | security | ✅ |
+| `graph` | `codebase-memory-gate` | graph | ⚠️ advisory |
+
+`<pkg>` is resolved per repository, so the same registry works on any project.
+
+### `audit_governance(root=None, repo=None)`
+Read-only actual-vs-policy report across three planes — workflow files on disk,
+branch protection on GitHub, and any org ruleset covering the repo. Every gap
+names the tool that closes it. Degrades to the local plane (never an error) when
+`gh` is missing or unauthenticated. **Call this first.**
+
+### `run_quality_checks(root=None, checks=None)`
+Runs the registry locally — the same commands CI runs. A check whose tool isn't
+installed is reported `skipped`, never `passed`.
+
+### `scaffold_ci(root=None, mode="reusable", org=None, dry_run=True)`
+Generates the workflow. `mode="reusable"` emits a ~12-line caller delegating to
+`<org>/.github`; `"standalone"` inlines everything; `"publish"` writes the
+org-side reusable definition. Every check becomes its own **job**, because a
+GitHub status-check context is a job name — that's what makes the required-check
+list real.
+
+### `apply_branch_protection(repo=None, branch=None, mode="standalone", dry_run=True)`
+Required status checks (strict), ≥1 approving review, no force-push, no
+deletion. Warns when a required context has never reported — GitHub accepts
+unknown context names, and one that never reports blocks every PR forever.
+
+### `apply_org_ruleset(org, repo_pattern="~ALL", workflow_repo=None, dry_run=True)`
+Defines the policy once at the org level so new repos inherit it with zero
+per-repo setup. Requires `admin:org`. Never called implicitly by another tool.
+
+All three mutating tools default to `dry_run=True` and build their preview from
+the same payload function the real call uses, so what you review is exactly what
+gets sent.
 
 ---
 
@@ -403,20 +461,41 @@ Add to an MCP client (e.g. Claude Code `.mcp.json`):
 }
 ```
 
-### CI gate (Layer 1) sketch
+### Bringing a repository up to policy
 
-```bash
-# 1. build the graph for the PR head
-codebase-memory-mcp  # or: python -c "from codebase_memory.indexer import index_project; ..."
+The intended order matters — GitHub only accepts a status check as *required* by
+a name it has already observed, so the workflow must run once before protection
+is applied:
 
-# 2. call detect_changes(base="origin/main") via the MCP client and fail on:
-#      gate_should_block == true
-# 3. commit graph.db.zst so the next run and reviewers share the same index
+```text
+audit_governance()                          # what's missing, and what fixes it
+scaffold_ci(mode="standalone", dry_run=False)
+  → commit, open a PR, let the workflow run once
+apply_branch_protection(dry_run=True)       # review the payload
+apply_branch_protection(dry_run=False)      # enforce
+audit_governance()                          # compliant: true
 ```
 
-The graph must reflect the `head` state, so **index before** calling
-`detect_changes`. Note: a brand-new **untracked** file is absent from
-`git diff HEAD` — use the `base...head` range for committed PR analysis.
+For an organization, do it once instead of per repo:
+
+```text
+scaffold_ci(mode="publish")   # write the reusable workflow into <org>/.github
+apply_org_ruleset("<org>", workflow_repo="<org>/.github", dry_run=False)
+```
+
+### Structural gate in CI
+
+`codebase-memory-gate` indexes the head state and runs `detect_changes`, exiting
+non-zero when `gate_should_block` is true:
+
+```bash
+codebase-memory-gate --base origin/main        # exit 1 blocks the build
+codebase-memory-gate --base origin/main --json # full report
+codebase-memory-gate --advisory                # report only, always exit 0
+```
+
+Note: a brand-new **untracked** file is absent from `git diff HEAD` — use the
+`base...head` range for committed PR analysis.
 
 ---
 
@@ -440,12 +519,13 @@ just this file, zstd‑compressed.
 ## Testing
 
 ```bash
-pytest            # 23 tests, ~0.22 s
+pytest            # 55 tests, ~0.32 s
 pytest -v         # per-test breakdown
 ```
 
 | File | Tests | What it pins |
 |---|---:|---|
+| `test_governance.py` | 32 | registry/package resolution, generated workflow parses with one job per check, contexts match real job names, protection + ruleset payload shape, audit gap detection, `dry_run` makes no API call |
 | `test_indexer.py` | 6 | symbol collection, `CONTAINS`/`IMPORTS`/`CALLS`, unique-name fallback (`resolved=False`), persistence roundtrip |
 | `test_queries.py` | 6 | callers/callees, dead code + entrypoint exclusion, `by_name`/`by_kind`, `trace_path` (found & none), architecture |
 | `test_changes.py` | 5 | diff parsing (modify/add/delete), high-risk blocks without tests, low-risk when no callers, test-change suppresses block — over a **real git repo** |
@@ -474,6 +554,16 @@ These are intentional given the design and the chosen backend, not oversights:
 - **`HIGH_FANIN = 5`** is a hardcoded threshold.
 - **Untracked new files** don't appear in `git diff HEAD` (a git limitation);
   use `base...head` for committed PRs.
+- **The graph check is advisory**, not merge-blocking. Blast radius is a
+  heuristic; a noisy blocking gate only teaches people to bypass it. Promote it
+  after calibrating `HIGH_FANIN` on real PRs.
+- **Governance checks are Python-only**, matching the indexer. A Node or Go repo
+  still gets protection and rulesets, but needs a second check registry.
+- **Branch protection on private repos** requires a paid GitHub plan; org
+  rulesets covering private repos require Team/Enterprise. Both are free for
+  public repositories, and both tools surface this rather than a bare 403.
+- **`gh` is required for the remote plane.** Without it, `audit_governance`
+  reports the local plane only and the apply tools work in `dry_run` alone.
 
 ---
 
@@ -487,8 +577,20 @@ codebase_memory/
   queries.py     196    read/traversal queries (search_graph, architecture, trace_path)
   changes.py     214    detect_changes: git diff → blast radius → risk
   traces.py      135    ingest_traces reconciliation + .zst snapshot save/load
-  server.py      223    FastMCP server wiring the 9 tools
-tests/           452    23 tests (indexer, queries, changes, traces)
+  server.py      382    FastMCP server wiring the 14 tools
+  governance/
+    checks.py    159    the CHECKS registry — single source of truth
+    policy.py    139    desired state + GitHub API payload builders
+    scaffold.py  214    CHECKS → workflow YAML (standalone/reusable/caller)
+    audit.py     297    actual-vs-policy across local, remote, and org planes
+    apply.py     158    branch protection + org ruleset, dry_run by default
+    gh.py        153    thin `gh` CLI wrapper (no token ever held)
+    gate.py       57    codebase-memory-gate CLI for the CI step
+    runner.py     93    run the registry locally
+.github/workflows/
+  quality-gate.yml           generated by scaffold_ci — this repo dogfoods it
+  reusable-quality-gate.yml  the org-shareable definition
+tests/           730    55 tests (indexer, queries, changes, traces, governance)
 ```
 
-*Source: 1,328 lines across 7 modules; tests: 452 lines. (Measured via `wc -l`.)*
+*Source: 2,763 lines across 15 modules; tests: 730 lines. (Measured via `wc -l`.)*

@@ -6,6 +6,7 @@ from pathlib import Path
 from codebase_memory.changes import detect_changes, parse_unified_diff
 from codebase_memory.indexer import index_project
 
+
 # --------------------------------------------------------------------------- #
 # Pure diff parsing
 # --------------------------------------------------------------------------- #
